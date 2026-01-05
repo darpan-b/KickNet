@@ -371,7 +371,7 @@ else:
 ```bibtex
 @software{soccer_mappo_2025,
   title={3v3 Multi-Agent Soccer with MAPPO},
-  author={Your Name},
+  author={BSB},
   year={2025},
   description={MAPPO implementation for multi-agent soccer with centralized training and decentralized execution}
 }
