@@ -220,7 +220,7 @@ If you use this code, please cite:
 ```
 @software{soccer_iac_2025,
   title={3v3 Multi-Agent Soccer with Independent Actor-Critic},
-  author={Your Name},
+  author={BSB},
   year={2025}
 }
 ```
