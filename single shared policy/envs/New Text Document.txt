@@ -1,0 +1,406 @@
+import numpy as np
+import pygame
+from gymnasium.spaces import Box, Discrete
+from pettingzoo.utils.env import ParallelEnv
+
+
+class SoccerEnv3v3(ParallelEnv):
+    """
+    Fully improved 3v3 soccer environment for MARL:
+    - Correct distance rewards
+    - Forward ball-progress reward
+    - Defender intercept reward
+    - Counterattack reward
+    - Shooting reward near goal
+    - Anti-crowding
+    - Better passes
+    - Better movement system
+    - Possession-aware strategy
+    """
+
+    metadata = {"render_modes": ["human", None], "name": "soccer_3v3"}
+
+    PLAYER_SPEED = 5.0
+    BALL_SPEED = 8.0
+
+    def __init__(self, render_mode=None):
+        self.possible_agents = [f"player_{i}" for i in range(6)]
+        self.agents = self.possible_agents[:]
+        self.render_mode = render_mode
+
+        # Field
+        self.screen_width = 800
+        self.screen_height = 600
+        self.ball_size = 12
+        self.player_size = 20
+
+        # Pygame initialization
+        pygame.init()
+        self.screen = None
+        self.clock = None
+        if self.render_mode == "human":
+            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+            pygame.display.set_caption("3v3 Soccer")
+            self.clock = pygame.time.Clock()
+
+        # Entities
+        self.ball = pygame.Rect(
+            self.screen_width // 2,
+            self.screen_height // 2,
+            self.ball_size,
+            self.ball_size,
+        )
+        self.players = [pygame.Rect(0, 0, self.player_size, self.player_size) for _ in range(6)]
+
+        # Movement states
+        self.player_vel = [pygame.Vector2(0, 0) for _ in range(6)]
+        self.ball_vel = pygame.Vector2(0, 0)
+
+        self.possessor = None      # who holds the ball
+        self.prev_distances = [None] * 6
+        self.prev_ball_x = None
+        self.prev_possessor_team = None
+
+        # Roles: striker=0, support=1, defender=2 per team
+        self.roles = [0, 1, 2, 0, 1, 2]
+
+        # Obs = 18 dims
+        # [px,py, vx,vy, bx,by, 2 mates pos, 3 opp pos, ball_owned, role_id]
+        self.obs_dim = 18
+        self.observation_space = {
+            agent: Box(-1e9, 1e9, shape=(self.obs_dim,), dtype=np.float32)
+            for agent in self.possible_agents
+        }
+        self.action_space = {agent: Discrete(8) for agent in self.possible_agents}
+
+        # Reward parameters
+        self.approach_scale = 0.01
+        self.possession_reward = 0.3
+        self.intercept_bonus = 0.5
+        self.pass_success_reward = 0.15
+        self.backward_penalty_scale = -0.02
+        self.shoot_reward = 0.4
+        self.crowd_penalty = -0.05
+        self.role_bonus = 0.02
+        self.crowd_dist_thresh = 40.0
+
+    # ----------------------------------------
+    # Utility
+    # ----------------------------------------
+    def _team_info(self, idx):
+        if idx < 3:
+            mates = [j for j in range(3) if j != idx]
+            opps = [3, 4, 5]
+            team_id = 0
+        else:
+            mates = [j for j in range(3, 6) if j != idx]
+            opps = [0, 1, 2]
+            team_id = 1
+        return mates, opps, team_id
+
+    def _get_obs(self):
+        obs = {}
+        for i, agent in enumerate(self.agents):
+            p = self.players[i]
+            vel = self.player_vel[i]
+
+            # Basic features
+            ppos = np.array([p.centerx, p.centery], np.float32)
+            pvel = np.array([vel.x, vel.y], np.float32)
+            bpos = np.array([self.ball.centerx, self.ball.centery], np.float32)
+
+            mates, opps, _ = self._team_info(i)
+
+            mate_pos = np.array(
+                [coord for j in mates for coord in (self.players[j].centerx, self.players[j].centery)],
+                dtype=np.float32,
+            )
+            opp_pos = np.array(
+                [coord for j in opps for coord in (self.players[j].centerx, self.players[j].centery)],
+                dtype=np.float32,
+            )
+
+            ball_owned = 1.0 if self.possessor == i else 0.0
+            role_id = float(self.roles[i])
+
+            obs_vec = np.concatenate([
+                ppos, pvel, bpos,
+                mate_pos, opp_pos,
+                np.array([ball_owned, role_id], dtype=np.float32)
+            ])
+
+            obs[agent] = obs_vec
+
+        return obs
+
+    # ----------------------------------------
+    # RESET
+    # ----------------------------------------
+    def reset(self, seed=None, options=None):
+        self.agents = self.possible_agents[:]
+
+        # Ball center
+        self.ball.center = (self.screen_width // 2, self.screen_height // 2)
+        self.ball_vel = pygame.Vector2(0, 0)
+
+        # Player start positions
+        self.players[0].center = (120, 150)
+        self.players[1].center = (120, 300)
+        self.players[2].center = (120, 450)
+        self.players[3].center = (680, 150)
+        self.players[4].center = (680, 300)
+        self.players[5].center = (680, 450)
+
+        self.player_vel = [pygame.Vector2(0, 0) for _ in range(6)]
+        self.prev_distances = [None] * 6
+        self.possessor = None
+        self.prev_ball_x = self.ball.centerx
+        self.prev_possessor_team = None
+
+        return self._get_obs(), {a: {} for a in self.agents}
+
+    # ----------------------------------------
+    # STEP
+    # ----------------------------------------
+    def step(self, actions):
+        rewards = {a: 0.0 for a in self.agents}
+        terminations = {a: False for a in self.agents}
+        truncations = {a: False for a in self.agents}
+        infos = {a: {} for a in self.possible_agents}
+
+        pass_targets = {}
+        touch_events = set()
+
+        # ----------------------------
+        # PHASE 1 — ACTION DECISION
+        # ----------------------------
+        for i, agent in enumerate(self.agents):
+            a = actions.get(agent, 7)  # idle default
+            vel = pygame.Vector2(0, 0)
+
+            # Movement
+            if a == 0: vel.y = -self.PLAYER_SPEED  # up
+            elif a == 1: vel.y = self.PLAYER_SPEED  # down
+            elif a == 2: vel.x = -self.PLAYER_SPEED  # left
+            elif a == 3: vel.x = self.PLAYER_SPEED  # right
+            elif a == 4:
+                # Dash = 1.5× speed in previous direction or toward ball
+                if self.player_vel[i].length() > 0.2:
+                    vel = self.player_vel[i].normalize() * (self.PLAYER_SPEED * 1.5)
+                else:
+                    direction = pygame.Vector2(self.ball.center) - pygame.Vector2(self.players[i].center)
+                    if direction.length() > 0:
+                        vel = direction.normalize() * (self.PLAYER_SPEED * 1.2)
+
+            # Kick
+            elif a == 5:
+                if self.players[i].colliderect(self.ball):
+                    direction = pygame.Vector2(self.ball.center) - pygame.Vector2(self.players[i].center)
+                    if direction.length() > 0:
+                        self.ball_vel = direction.normalize() * self.BALL_SPEED
+                        rewards[agent] += 0.05
+                        touch_events.add(i)
+                        self.possessor = i
+
+            # Pass
+            elif a == 6:
+                if self.players[i].colliderect(self.ball):
+                    mates, _, _ = self._team_info(i)
+                    mypos = pygame.Vector2(self.players[i].center)
+                    best, best_score = None, -1e9
+                    for m in mates:
+                        mpos = pygame.Vector2(self.players[m].center)
+                        score = mpos.distance_to(mypos)
+                        if score > best_score:
+                            best_score = score
+                            best = m
+                    if best is not None:
+                        pass_targets[i] = best
+                        touch_events.add(i)
+                        self.possessor = None
+
+            # Apply blended velocity (fix drift)
+            self.player_vel[i] = self.player_vel[i] * 0.2 + vel * 0.8
+
+        # ----------------------------
+        # PHASE 2 — PASS LOGIC
+        # ----------------------------
+        for passer, target in pass_targets.items():
+            passer_pos = pygame.Vector2(self.players[passer].center)
+            target_pos = pygame.Vector2(self.players[target].center)
+            direction = target_pos - passer_pos
+            if direction.length() > 0:
+                self.ball_vel = direction.normalize() * (self.BALL_SPEED * 0.9)
+            else:
+                self.ball_vel = pygame.Vector2(self.BALL_SPEED * 0.5, 0)
+
+        # ----------------------------
+        # PHASE 3 — PHYSICS UPDATE
+        # ----------------------------
+        for i in range(6):
+            self.players[i].move_ip(self.player_vel[i])
+            self.player_vel[i] *= 0.85
+            self.players[i].clamp_ip(pygame.Rect(0, 0, self.screen_width, self.screen_height))
+
+        self.ball.move_ip(self.ball_vel)
+        self.ball_vel *= 0.95
+        self.ball.clamp_ip(pygame.Rect(0, 0, self.screen_width, self.screen_height))
+
+        # ----------------------------
+        # PHASE 4 — POSSESSION DETECTION
+        # ----------------------------
+        colliders = [i for i in range(6) if self.players[i].colliderect(self.ball)]
+        if colliders:
+            ball_center = pygame.Vector2(self.ball.center)
+            nearest = min(colliders, key=lambda j: pygame.Vector2(self.players[j].center).distance_to(ball_center))
+
+            previous = self.possessor
+            if previous != nearest:
+                # Intercept (steal) event
+                if previous is not None:
+                    prev_team = previous // 3
+                    curr_team = nearest // 3
+                    if prev_team != curr_team:
+                        # Counterattack reward
+                        rewards[self.agents[nearest]] += self.intercept_bonus
+                        for m in [0, 1, 2, 3, 4, 5]:
+                            if m // 3 == curr_team:
+                                rewards[self.agents[m]] += 0.1
+
+            self.possessor = nearest
+            self.ball_vel *= 0.2
+
+        # ----------------------------
+        # PHASE 5 — REWARD SHAPING
+        # ----------------------------
+        curr_ball_x = self.ball.centerx
+
+        for i, agent in enumerate(self.agents):
+            mates, _, team_id = self._team_info(i)
+
+            # Distance change reward
+            curr_dist = pygame.Vector2(self.players[i].center).distance_to(self.ball.center)
+            prev_dist = self.prev_distances[i]
+            if prev_dist is not None:
+                rewards[agent] += self.approach_scale * (prev_dist - curr_dist)
+            self.prev_distances[i] = curr_dist
+
+            # Possession reward
+            if self.possessor == i:
+                rewards[agent] += self.possession_reward
+
+            # Defender intercept incentive
+            if self.possessor is not None:
+                poss_team = self.possessor // 3
+                if team_id != poss_team:
+                    if prev_dist is not None:
+                        rewards[agent] += 0.02 * (prev_dist - curr_dist)
+
+            # Anti-crowding
+            min_dist = min(
+                pygame.Vector2(self.players[i].center).distance_to(self.players[m].center)
+                for m in mates
+            )
+            if min_dist < self.crowd_dist_thresh:
+                rewards[agent] += self.crowd_penalty * (1 - min_dist / self.crowd_dist_thresh)
+
+            # ROLE adherence
+            role = self.roles[i]
+            px = self.players[i].centerx
+            if team_id == 0:
+                attacking = px > self.screen_width * 0.45
+                defending = px < self.screen_width * 0.55
+            else:
+                attacking = px < self.screen_width * 0.55
+                defending = px > self.screen_width * 0.45
+
+            if role == 0 and attacking:
+                rewards[agent] += self.role_bonus
+            elif role == 2 and defending:
+                rewards[agent] += self.role_bonus * 0.8
+
+            # ----------------------------
+            # BALL PROGRESS REWARD
+            # ----------------------------
+            prev_ball_x = self.prev_ball_x
+            ball_progress = curr_ball_x - prev_ball_x if team_id == 0 else prev_ball_x - curr_ball_x
+
+            # Only reward progress when team has possession
+            if self.possessor is not None and self.possessor // 3 == team_id:
+                rewards[agent] += 0.02 * ball_progress
+
+                # Penalty for backwards movement
+                if ball_progress < 0:
+                    rewards[agent] += self.backward_penalty_scale * abs(ball_progress)
+
+            # Shooting reward near opponent goal
+            if team_id == 0 and curr_ball_x > self.screen_width * 0.85:
+                if i == self.possessor:
+                    rewards[agent] += self.shoot_reward
+            if team_id == 1 and curr_ball_x < self.screen_width * 0.15:
+                if i == self.possessor:
+                    rewards[agent] += self.shoot_reward
+
+        # Update stored ball_x
+        self.prev_ball_x = curr_ball_x
+
+        # ----------------------------
+        # GOALS
+        # ----------------------------
+        if self.ball.left <= 0:  # Right team scores
+            for j, agent in enumerate(self.agents):
+                rewards[agent] += 2.0 if j >= 3 else -1.5
+            terminations = {a: True for a in self.agents}
+            self.agents = []
+
+        if self.ball.right >= self.screen_width:  # Left team scores
+            for j, agent in enumerate(self.agents):
+                rewards[agent] += 2.0 if j < 3 else -1.5
+            terminations = {a: True for a in self.agents}
+            self.agents = []
+
+        return self._get_obs(), rewards, terminations, truncations, infos
+
+    # ----------------------------------------
+    # RENDER
+    # ----------------------------------------
+    def render(self):
+        if self.render_mode != "human" or self.screen is None:
+            return
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+
+        self.screen.fill((0, 128, 0))
+
+        pygame.draw.rect(self.screen, (255, 255, 255), (0, 200, 10, 200))
+        pygame.draw.rect(self.screen, (255, 255, 255), (self.screen_width - 10, 200, 10, 200))
+
+        # Draw players
+        for i, p in enumerate(self.players):
+            color = (0, 0, 255) if i < 3 else (255, 0, 0)
+
+            if i == self.possessor:
+                pygame.draw.rect(self.screen, (255, 255, 0), p)
+            else:
+                pygame.draw.rect(self.screen, color, p)
+
+            # role marker
+            role = self.roles[i]
+            rx, ry = p.centerx, p.centery - 16
+            if role == 0:
+                pygame.draw.circle(self.screen, (0, 255, 0), (rx, ry), 4)
+            elif role == 1:
+                pygame.draw.circle(self.screen, (0, 255, 255), (rx, ry), 4)
+            else:
+                pygame.draw.circle(self.screen, (255, 0, 255), (rx, ry), 4)
+
+        pygame.draw.ellipse(self.screen, (255, 255, 255), self.ball)
+
+        pygame.display.flip()
+        if self.clock:
+            self.clock.tick(60)
+
+    def close(self):
+        pygame.quit()
