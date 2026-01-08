@@ -15,15 +15,18 @@
 - **MAPPO (CTDE)**: Multi-Agent PPO using *Centralized Training with Decentralized Execution (CTDE)*. The *Critic* utilizes a global state, while *Actors* operate on local observations.
 
 ## MAPPO Advantage Calculation
-
 MAPPO utilizes **Generalized Advantage Estimation (GAE)** with:
-- \( \lambda = 0.95 \)
-- \( \gamma = 0.99 \)
 
-\[
+$$\gamma = 0.95\ and\ \lambda = 0.99$$
+
+The temporal-difference residual is defined as:
+
+$$
 \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
-\]
+$$
 
-\[
-A_t^{GAE} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}
-\]
+The GAE advantage estimate is then:
+
+$$
+A_t^{\mathrm{GAE}} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \, \delta_{t+l}
+$$
