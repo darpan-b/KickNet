@@ -15,4 +15,4 @@ This project is divided into two primary components:
 - **KickNet**: The development and evaluation of a multi-agent reinforcement learning (MARL) framework for a 3v3 soccer environment using shared policies, Independent Actor-Critic (IAC), and MAPPO.
 
 ## License
-This project was developed for an academic assessment on Deep Reinforcement Learning. Code is based on stable-baselines3 documentation.
+This project was developed for an academic assessment on Deep Reinforcement Learning. Code is based on ```stable-baselines3``` documentation.
