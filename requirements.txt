@@ -1,0 +1,19 @@
+# --- RL & Environment ---
+torch>=2.0.0
+stable-baselines3[extra]>=2.1.0
+gymnasium[atari,accept-rom-license]>=0.29.0
+ale-py>=0.8.1
+shimmy>=1.0.0
+opencv-python>=4.8.0
+
+# --- Logging ---
+tensorboard>=2.14.0
+tensorflow>=2.14.0  # only if using summary_iterator
+
+# --- Data & Visualization ---
+numpy
+pandas
+matplotlib
+seaborn
+tqdm
+
